@@ -1,6 +1,9 @@
 from transformers import PretrainedConfig
+from typing import Optional
+import math 
 
-
+#PretrainedConfig是Hugging Face Transformers库中的一个基类，用于定义预训练模型的配置。它包含了模型的超参数和其他相关信息，
+# 允许用户在加载或保存模型时使用一致的配置。通过继承PretrainedConfig，用户可以创建自定义模型配置类，以便在训练和推理过程中使用特定的参数设置。
 class MokioMindConfig(PretrainedConfig):
     model_type = "mokiomind"
 
@@ -86,11 +89,66 @@ class RMSNorm(nn.Module):
         super().__init__()
         self.dim = dim
         self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
+        self.weight = nn.Parameter(torch.ones(dim))#Parameter会自动标注为可训练参数,并且会被加入到模型的参数列表中,在训练过程中会被优化器更新.
 #norm
     def _norm(self,x):
         return torch.rsqrt(x.pow(2).mean(-1,keepdim=True)+self.eps)
     
 #forward前向传播
     def forward(self,x):
-        return x*self._norm(x.float()).type_as(x) * self.weight
+        return x*self._norm(x.float()).type_as(x) * self.weight.type_as(x)
+def precompute_freqs_cli(dim:int,rope_base,end:int=32*1024,rope_scaling:Optional[dict]=None):
+    #初始化rope频率
+    freqs,attn_factor = (1.0/(rope_base ** (torch.arange(0,dim,2).float()/dim)),1.0)
+    #如果rope_scaling不为空,则进行缩放
+    if rope_scaling is not None:
+        original_max,factor,beta_fast,beta_slow = (
+            rope_scaling["original_max_position_embeddings"],
+            rope_scaling["factor"],
+            rope_scaling["beta_fast"],
+            rope_scaling["beta_slow"])
+        #推断长度大于原始最大位置嵌入长度时,进行缩放
+        if end>original_max:
+            #频率b到i的映射
+            inv_dim = lambda b:(dim*math.log(original_max/(b*2*math.pi)))/(2*math.log(rope_base))#b本质上就是该维度的归一化频率（Normalized Frequency），它代表着这个维度在整个上下文窗口内振荡的总圈数（周期数）
+            #划分高低维度
+            #low:不需要缩放的高频部分
+            #high:需要缩放的低频部分
+            low,high = (max(math.floor(inv_dim(beta_fast)),0),min(math.ceil(inv_dim(beta_slow)),dim//2-1))
+
+            #计算缩放因子
+            #在low之前，ramp为0,在high之后，ramp为1,在low和high之间，ramp为线性插值，ramp保存了每个维度的缩放因子
+            ramp = torch.clamp(
+                (torch.arange(dim // 2,device=freqs.device).float()-low)
+                / max(high-low,0.001),
+                0,
+                1
+            )
+            freqs = freqs * (1-ramp+ramp/factor)
+        # 根据end，生成位置索引
+        t = torch.arange(end,device=freqs.device).float()
+
+        #计算外积，将t和缩放因子相乘，得到每个位置的旋转角度
+        freqs = torch.outer(t,freqs).float()
+        freqs_cos = (
+            torch.cat(
+                [torch.cos(freqs),torch.cos(freqs)],
+                dim=-1
+            )*attn_factor
+        )
+        freqs_sin = (
+            torch.cat(
+                [torch.sin(freqs),torch.sin(freqs)],
+                dim=-1
+            )*attn_factor
+        )
+        return freqs_cos, freqs_sin
+#编写rope
+def apply_rotary_pos_emb(q,k,freqs_cos,freqs_sin):
+    #[a,b]->[-b,a]
+    def rotate_half(x):
+        return torch.cat([-x[...,x.shape[-1]//2:],x[...,:x.shape[-1]//2]],dim=-1).reshape_as(x)
+    #实现x_rotated = x * cos + rotate_half(x) * sin
+    q_embed = (q*freqs_cos.unsqueeze(1))+rotate_half(q)*freqs_sin.unsqueeze(1)
+    k_embed = (k*freqs_cos.unsqueeze(1))+rotate_half(k)*freqs_sin.unsqueeze(1)#unsqueeze
+    return q_embed, k_embed
