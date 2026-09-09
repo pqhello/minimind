@@ -1,10 +1,10 @@
-from transformers import PretrainedConfig
-from typing import Optional
+from transformers import PreTrainedConfig
+from typing import Optional,Tuple
 import math 
 
 #PretrainedConfig是Hugging Face Transformers库中的一个基类，用于定义预训练模型的配置。它包含了模型的超参数和其他相关信息，
 # 允许用户在加载或保存模型时使用一致的配置。通过继承PretrainedConfig，用户可以创建自定义模型配置类，以便在训练和推理过程中使用特定的参数设置。
-class MokioMindConfig(PretrainedConfig):
+class MokioMindConfig(PreTrainedConfig):
     model_type = "mokiomind"
 
     def __init__(
@@ -81,8 +81,10 @@ RMSnorm 的作用就是归一化,防止计算值过大或者过小导致数值�
 通常防止梯度爆炸和梯度消失,从而提高模型的训练稳定性和性能.
 '''
 #继承nn.Module类
-import torch
+import torch  # type: ignore[import-not-found]
 import torch.nn as nn
+from torch.nn import functional as F
+from .activation_functions import ACT2FN
 class RMSNorm(nn.Module):
 #__init__初始化
     def __init__(self,dim:int,eps:float=1e-5):
@@ -128,7 +130,7 @@ def precompute_freqs_cli(dim:int,rope_base,end:int=32*1024,rope_scaling:Optional
         # 根据end，生成位置索引
         t = torch.arange(end,device=freqs.device).float()
 
-        #计算外积，将t和缩放因子相乘，得到每个位置的旋转角度
+        #计算外积，将t和缩放因子相乘，得到每token对应的的旋转角度
         freqs = torch.outer(t,freqs).float()
         freqs_cos = (
             torch.cat(
@@ -142,6 +144,8 @@ def precompute_freqs_cli(dim:int,rope_base,end:int=32*1024,rope_scaling:Optional
                 dim=-1
             )*attn_factor
         )
+        #为什么要分别计算cos和sin？因为在旋转位置编码中，我们需要将输入的查询和键向量分别与cos和sin进行组合，以实现旋转变换。具体来说，旋转位置编码的公式为：
+        # x_rotated = x * cos + rotate_half(x) * sin=x*旋转矩阵原本的位置复杂度是O(n^2)，但是通过旋转位置编码，我们可以将其降为O(n)，从而提高计算效率。
         return freqs_cos, freqs_sin
 #编写rope
 def apply_rotary_pos_emb(q,k,freqs_cos,freqs_sin):
@@ -150,5 +154,135 @@ def apply_rotary_pos_emb(q,k,freqs_cos,freqs_sin):
         return torch.cat([-x[...,x.shape[-1]//2:],x[...,:x.shape[-1]//2]],dim=-1).reshape_as(x)
     #实现x_rotated = x * cos + rotate_half(x) * sin
     q_embed = (q*freqs_cos.unsqueeze(1))+rotate_half(q)*freqs_sin.unsqueeze(1)
-    k_embed = (k*freqs_cos.unsqueeze(1))+rotate_half(k)*freqs_sin.unsqueeze(1)#unsqueeze
+    k_embed = (k*freqs_cos.unsqueeze(1))+rotate_half(k)*freqs_sin.unsqueeze(1)#unsqueeze为什么是1，
     return q_embed, k_embed
+def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+    bs, slen, num_key_value_heads, head_dim = x.shape
+    if n_rep == 1:
+        return x
+
+    return (
+        x[:, :, :, None, :]
+        .expand(bs, slen, num_key_value_heads, n_rep, head_dim)
+        .reshape(bs, slen, num_key_value_heads * n_rep, head_dim)
+    )
+class Attention(nn.Module):
+    def __init__(self, args: MokioMindConfig):
+        super().__init__()
+
+        self.num_key_value_heads = (
+            args.num_attention_heads
+            if args.num_key_value_heads is None
+            else args.num_key_value_heads
+        )
+
+        assert args.num_attention_heads % self.num_key_value_heads == 0
+
+        self.n_local_heads = args.num_attention_heads
+        self.n_local_kv_heads = self.num_key_value_heads
+        self.n_rep = self.n_local_heads // self.n_local_kv_heads
+        self.head_dim = args.hidden_size // args.num_attention_heads
+
+        self.q_proj = nn.Linear(
+            args.hidden_size, args.num_attention_heads * self.head_dim, bias=False
+        )
+        self.k_proj = nn.Linear(
+            args.hidden_size, self.num_key_value_heads * self.head_dim, bias=False
+        )
+        self.v_proj = nn.Linear(
+            args.hidden_size, self.num_key_value_heads * self.head_dim, bias=False
+        )
+        self.o_proj = nn.Linear(
+            args.num_attention_heads * self.head_dim, args.hidden_size, bias=False
+        )
+
+        self.attn_dropout = nn.Dropout(args.dropout)
+        self.resid_dropout = nn.Dropout(args.dropout)
+        self.dropout = args.dropout
+        self.flash = (
+            hasattr(torch.nn.functional, "scaled_dot_product_attention")
+            and args.flash_attention
+        )
+    
+
+    def forward(
+            self, x:torch.Tensor, position_embedding:Tuple[torch.Tensor, torch.Tensor], 
+            attention_mask: Optional[torch.Tensor] = None, 
+            past_key_values: Optional[Tuple[torch.Tensor,torch.Tensor]] = None, use_cache: bool = False
+    ):
+        #投影，计算qkv
+        bsz,seq_len,_ = x.shape
+        xq,xk,xv = self.q_proj(x),self.k_proj(x),self.v_proj(x)
+
+        #把输入拆分为多个头，使用view
+        q = xq.view(bsz,seq_len,self.n_local_heads,self.head_dim)
+        k = xk.view(bsz,seq_len,self.n_local_kv_heads,self.head_dim)
+        v = xv.view(bsz,seq_len,self.n_local_kv_heads,self.head_dim)
+        #q和k，使用rope进行旋转位置编码
+        cos,sin = position_embedding
+        xq,xk = apply_rotary_pos_emb(xq,xk,cos,sin)#这里的con,sin维度是多少？
+        #对于k和v，使用repeat(注意kv cache)
+        if past_key_values is not None:
+            xk = torch.cat([past_key_values[0],xk],dim=1)
+            xv = torch.cat([past_key_values[1],xv],dim=1)
+        past_key_values = (xk,xv) if use_cache else None
+
+        xq,xk,xv = (
+            #[bsz,seqlen,heads,head_dim]
+            xq.transpose(1,2),
+            #[bsz,heads,seqlen,head_dim]
+            repeat_kv(xk,self.n_rep).transpose(1,2),
+            repeat_kv(xv,self.n_rep).transpose(1,2)
+        )
+        #进行attention计算
+        if self.flash and seq_len > 1 and (attention_mask is None or torch.all(attention_mask==1)):
+            attn_mask = (
+                None
+                if attention_mask is None
+                else attention_mask.view(bsz,1,1,-1).expand(bsz,self.n_local_heads,seq_len,-1).bool()
+            )
+            output = F.scaled_dot_product_attention(xq,xk,xv,attn_mask=attn_mask,dropout_p = self.dropout if self.training else 0.0,is_causal=True)
+        else:
+            scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            scores[:, :, :, -seq_len:] += torch.triu(
+                torch.full((seq_len, seq_len), float("-inf"), device=scores.device),
+                diagonal=1,
+            )
+
+            if attention_mask is not None:
+                extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+                extended_attention_mask = (1.0 - extended_attention_mask) * -1e9
+                scores = scores + extended_attention_mask
+
+            scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+            scores = self.attn_dropout(scores)
+            output = scores @ xv
+
+
+        #最后拼接头，输出投影
+        output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
+        output = self.resid_dropout(self.o_proj(output))
+        return output, past_key_values
+
+class FeedForward(nn.Module):
+    def __init__(self, config: MokioMindConfig):
+        super().__init__()
+        if config.intermediate_size is None:
+            intermediate_size = int(config.hidden_size * 8 / 3)
+            config.intermediate_size = 64 * ((intermediate_size + 64 - 1) // 64)
+
+        self.gate_proj = nn.Linear(
+            config.hidden_size, config.intermediate_size, bias=False
+        )
+        self.down_proj = nn.Linear(
+            config.intermediate_size, config.hidden_size, bias=False
+        )
+        self.up_proj = nn.Linear(
+            config.hidden_size, config.intermediate_size, bias=False
+        )
+        self.dropout = nn.Dropout(config.dropout)
+        self.act_fn = ACT2FN[config.hidden_act]
+
+    def forward(self, x):
+        gated = self.act_fn(self.gate_proj(x)) * self.up_proj(x)#经过gate层用于筛选数据
+        return self.dropout(self.down_proj(gated))
