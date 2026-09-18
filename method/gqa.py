@@ -25,7 +25,12 @@ import torch.nn as nn
 # t2 = t1.transpose(0,1)
 # print(t2)
 
-t1 = torch.tensor([[1,2,3],[4,5,6],[7,8,9]])
-print(torch.triu(t1,diagonal=1)) #上三角矩阵
-print(torch.triu(t1,diagonal=-1)) #下三角矩阵
-print(torch.triu(t1)) #转置矩阵
+# t1 = torch.tensor([[1,2,3],[4,5,6],[7,8,9]])
+# print(torch.triu(t1,diagonal=1)) #上三角矩阵
+# print(torch.triu(t1,diagonal=-1)) #下三角矩阵
+# print(torch.triu(t1)) #转置矩阵
+
+x = torch.tensor([0,1,1,3,2,1])
+weights = torch.tensor([1.,1.,1.,2.,1.,1.])
+count = torch.bincount(x,weights)
+print(count)
